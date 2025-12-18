@@ -55,12 +55,12 @@ class TinyRecursiveModel(nn.Module):
         self,
         vocab_size: int,
         max_seq_len: int = 1024,
-        embed_dim: int = 128,
+        embed_dim: int = 64,
         num_layers: int = 2,
-        num_heads: int = 8,
-        ff_dim: int = 512,
-        latent_dim: int = 64,
-        dropout: float = 0.1
+        num_heads: int = 4,
+        ff_dim: int = 256,
+        latent_dim: int = 32,
+        dropout: float = 0.3
     ):
         super().__init__()
 

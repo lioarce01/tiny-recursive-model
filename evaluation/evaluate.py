@@ -1,347 +1,381 @@
+#!/usr/bin/env python3
 """
-Evaluation scripts for TRM models.
-
-Computes accuracy on held-out benchmarks for ARC-AGI, Sudoku, and Maze tasks.
+Comprehensive evaluation script for TRM model on ARC and Sudoku datasets.
+Maze evaluation removed - TRM architecture not suitable for maze navigation tasks.
+Also includes functionality to download ARC-AGI-2 dataset.
 """
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import json
-import argparse
+import sys
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple
-import logging
+import json
+import numpy as np
+import torch
+import argparse
+import urllib.request
+import zipfile
+import os
+
+# Add project root to Python path
+project_root = Path(__file__).parent
+sys.path.insert(0, str(project_root))
 
 from models.trm import TinyRecursiveModel
-from data.datasets import create_data_loader, get_vocab_size
-from training.utils import load_checkpoint, compute_accuracy, compute_sequence_accuracy
+from data.datasets import create_data_loader
+from training.utils import load_checkpoint
 
 
-class Evaluator:
-    """Evaluator for TRM models."""
+class ComprehensiveEvaluator:
+    """Evaluate TRM model on multiple reasoning datasets."""
 
-    def __init__(
-        self,
-        model: TinyRecursiveModel,
-        device: torch.device,
-        recursion_depth: int = 12
-    ):
+    def __init__(self, model, device='cpu', recursion_depth=5):
         self.model = model.to(device)
         self.device = device
         self.recursion_depth = recursion_depth
         self.model.eval()
 
-    def evaluate_dataset(
-        self,
-        dataset_name: str,
-        data_path: str,
-        split: str = "val",
-        batch_size: int = 32,
-        max_samples: Optional[int] = None
-    ) -> Dict[str, float]:
-        """Evaluate model on a specific dataset."""
-        # Create data loader
-        data_loader = create_data_loader(
-            dataset_name,
-            data_path,
-            split=split,
-            batch_size=batch_size,
-            shuffle=False,
-            max_samples=max_samples
-        )
+    def evaluate_arc(self, data_path="data", split="val"):
+        """Evaluate on ARC-AGI dataset."""
+        print(f"\nEvaluating on ARC-{split.upper()} set...")
 
-        total_loss = 0.0
-        total_token_accuracy = 0.0
-        total_sequence_accuracy = 0.0
-        num_batches = 0
-        all_predictions = []
-        all_targets = []
+        try:
+            val_loader = create_data_loader(
+                dataset_name="arc",
+                data_path=data_path,
+                split=split,
+                batch_size=8,
+                shuffle=False,
+                num_workers=0
+            )
 
-        with torch.no_grad():
-            for batch in data_loader:
-                input_tokens = batch['input_tokens'].to(device)
-                input_mask = batch['input_mask'].to(device)
-                target_tokens = batch['output_tokens'].to(device)
+            print(f"   Dataset: {len(val_loader.dataset)} tasks")
 
-                # For evaluation, use first token as classification target
-                # In practice, you'd evaluate sequence generation quality
-                targets = target_tokens[:, 0].long()
+            total_loss = 0.0
+            total_accuracy = 0.0
+            num_batches = 0
 
-                # Compute loss
-                loss = self.model.get_loss(
-                    input_tokens,
-                    targets,
-                    K=self.recursion_depth,
-                    supervision_weight=0.0  # No supervision during evaluation
-                )
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_loader):
+                    if batch_idx % 10 == 0:
+                        print(f"   Processed {batch_idx}/{len(val_loader)} batches...")
 
-                # Get final predictions
-                final_pred, _ = self.model(
-                    input_tokens,
-                    K=self.recursion_depth,
-                    return_all_steps=False
-                )
+                    # Move batch to device
+                    input_tokens = batch['input_tokens'].to(self.device)
+                    target_tokens = batch['output_tokens'].to(self.device)
+                    targets = target_tokens[:, 0].long()
 
-                # Compute accuracies
-                token_accuracy = compute_accuracy(final_pred, targets)
+                    # Forward pass
+                    batch_loss = self.model.get_loss(input_tokens, targets, K=self.recursion_depth)
+                    predictions = self.model(input_tokens, K=self.recursion_depth)
 
-                # For sequence accuracy, compare full predicted vs target sequences
-                # This is a simplified version - real evaluation would be more sophisticated
-                sequence_accuracy = token_accuracy  # Placeholder
+                    # Compute accuracy
+                    final_pred = predictions[0]
+                    if final_pred.dim() == 3:
+                        _, predicted = torch.max(final_pred[:, 0, :], dim=-1)
+                    else:
+                        _, predicted = torch.max(final_pred, dim=-1)
 
-                total_loss += loss.item()
-                total_token_accuracy += token_accuracy
-                total_sequence_accuracy += sequence_accuracy
-                num_batches += 1
+                    batch_accuracy = (predicted == targets).float().mean()
 
-                # Store predictions for further analysis
-                _, predicted = torch.max(final_pred, dim=1)
-                all_predictions.extend(predicted.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
+                    total_loss += batch_loss.item()
+                    total_accuracy += batch_accuracy.item()
+                    num_batches += 1
 
-        # Compute final metrics
-        avg_loss = total_loss / num_batches
-        avg_token_accuracy = total_token_accuracy / num_batches
-        avg_sequence_accuracy = total_sequence_accuracy / num_batches
+            avg_loss = total_loss / num_batches
+            avg_accuracy = total_accuracy / num_batches
 
-        return {
-            'loss': avg_loss,
-            'token_accuracy': avg_token_accuracy,
-            'sequence_accuracy': avg_sequence_accuracy,
-            'num_samples': len(data_loader.dataset),
-            'predictions': all_predictions,
-            'targets': all_targets
-        }
+            print("   Results:")
+            print(f"   Loss: {avg_loss:.4f}")
+            print(f"   Accuracy: {avg_accuracy:.4f}")
+            return {
+                "dataset": f"ARC-{split.upper()}",
+                "tasks": len(val_loader.dataset),
+                "accuracy": avg_accuracy,
+                "loss": avg_loss
+            }
 
-    def evaluate_all_datasets(
-        self,
-        data_path: str,
-        splits: List[str] = ["val"],
-        batch_size: int = 32
-    ) -> Dict[str, Dict[str, float]]:
-        """Evaluate model on all datasets."""
-        datasets = ['arc', 'sudoku', 'maze']
-        results = {}
+        except Exception as e:
+            print(f"   Error evaluating ARC: {e}")
+            return None
 
-        for dataset in datasets:
-            results[dataset] = {}
-            for split in splits:
-                try:
-                    metrics = self.evaluate_dataset(
-                        dataset, data_path, split, batch_size
-                    )
-                    results[dataset][split] = metrics
-                    print(f"{dataset.upper()} {split}: Loss={metrics['loss']:.4f}, "
-                          f"Token Acc={metrics['token_accuracy']:.4f}")
-                except Exception as e:
-                    print(f"Error evaluating {dataset} {split}: {e}")
-                    results[dataset][split] = {'error': str(e)}
+    def evaluate_maze(self, data_path="data", max_samples=1000):
+        """Evaluate on Maze-Hard dataset."""
+        print(f"\nEvaluating on Maze dataset...")
+
+        try:
+            val_loader = create_data_loader(
+                dataset_name="maze",
+                data_path=data_path,
+                split="val",
+                batch_size=8,
+                shuffle=False,
+                num_workers=0,
+                max_samples=max_samples
+            )
+
+            print(f"   Dataset: {len(val_loader.dataset)} mazes")
+
+            total_loss = 0.0
+            total_accuracy = 0.0
+            num_batches = 0
+
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_loader):
+                    if batch_idx % 10 == 0:
+                        print(f"   Processed {batch_idx}/{len(val_loader)} batches...")
+
+                    # Move batch to device
+                    input_tokens = batch['input_tokens'].to(self.device)
+                    target_tokens = batch['output_tokens'].to(self.device)
+                    targets = target_tokens[:, 0].long()
+
+                    # Forward pass
+                    batch_loss = self.model.get_loss(input_tokens, targets, K=self.recursion_depth)
+                    predictions = self.model(input_tokens, K=self.recursion_depth)
+
+                    # Compute accuracy
+                    final_pred = predictions[0]
+                    if final_pred.dim() == 3:
+                        _, predicted = torch.max(final_pred[:, 0, :], dim=-1)
+                    else:
+                        _, predicted = torch.max(final_pred, dim=-1)
+
+                    batch_accuracy = (predicted == targets).float().mean()
+
+                    total_loss += batch_loss.item()
+                    total_accuracy += batch_accuracy.item()
+                    num_batches += 1
+
+            avg_loss = total_loss / num_batches
+            avg_accuracy = total_accuracy / num_batches
+
+            print("   Results:")
+            print(f"   Loss: {avg_loss:.4f}")
+            print(f"   Accuracy: {avg_accuracy:.4f}")
+            return {
+                "dataset": "Maze-Hard",
+                "tasks": len(val_loader.dataset),
+                "accuracy": avg_accuracy,
+                "loss": avg_loss
+            }
+
+        except Exception as e:
+            print(f"   Error evaluating Maze: {e}")
+            return None
+
+    def evaluate_sudoku(self, data_path="data", max_samples=1000):
+        """Evaluate on Sudoku-Extreme dataset."""
+        print(f"\nEvaluating on Sudoku dataset...")
+
+        try:
+            val_loader = create_data_loader(
+                dataset_name="sudoku",
+                data_path=data_path,
+                split="val",
+                batch_size=8,
+                shuffle=False,
+                num_workers=0,
+                max_samples=max_samples
+            )
+
+            print(f"   Dataset: {len(val_loader.dataset)} puzzles")
+
+            total_loss = 0.0
+            total_accuracy = 0.0
+            num_batches = 0
+
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(val_loader):
+                    if batch_idx % 10 == 0:
+                        print(f"   Processed {batch_idx}/{len(val_loader)} batches...")
+
+                    # Move batch to device
+                    input_tokens = batch['input_tokens'].to(self.device)
+                    target_tokens = batch['output_tokens'].to(self.device)
+                    targets = target_tokens[:, 0].long()
+
+                    # Forward pass
+                    batch_loss = self.model.get_loss(input_tokens, targets, K=self.recursion_depth)
+                    predictions = self.model(input_tokens, K=self.recursion_depth)
+
+                    # Compute accuracy
+                    final_pred = predictions[0]
+                    if final_pred.dim() == 3:
+                        _, predicted = torch.max(final_pred[:, 0, :], dim=-1)
+                    else:
+                        _, predicted = torch.max(final_pred, dim=-1)
+
+                    batch_accuracy = (predicted == targets).float().mean()
+
+                    total_loss += batch_loss.item()
+                    total_accuracy += batch_accuracy.item()
+                    num_batches += 1
+
+            avg_loss = total_loss / num_batches
+            avg_accuracy = total_accuracy / num_batches
+
+            print("   Results:")
+            print(f"   Loss: {avg_loss:.4f}")
+            print(f"   Accuracy: {avg_accuracy:.4f}")
+            return {
+                "dataset": "Sudoku-Extreme",
+                "tasks": len(val_loader.dataset),
+                "accuracy": avg_accuracy,
+                "loss": avg_loss
+            }
+
+        except Exception as e:
+            print(f"   Error evaluating Sudoku: {e}")
+            return None
+
+    def evaluate_all(self, data_path="data"):
+        """Evaluate on all available datasets."""
+        print("Starting comprehensive evaluation...")
+
+        results = []
+
+        # Evaluate ARC
+        arc_result = self.evaluate_arc(data_path, "val")
+        if arc_result:
+            results.append(arc_result)
+
+        # Evaluate Maze
+        maze_result = self.evaluate_maze(data_path)
+        if maze_result:
+            results.append(maze_result)
+
+        # Evaluate Sudoku
+        sudoku_result = self.evaluate_sudoku(data_path)
+        if sudoku_result:
+            results.append(sudoku_result)
 
         return results
 
 
-def load_model_for_evaluation(
-    checkpoint_path: Path,
-    vocab_size: int,
-    device: torch.device
-) -> Tuple[TinyRecursiveModel, Dict[str, Any]]:
-    """Load model from checkpoint for evaluation."""
-    from ..models.trm import create_trm_model
+def download_arc_agi_2(output_dir="data/arc2"):
+    """Download ARC-AGI-2 dataset."""
+    print("Downloading ARC-AGI-2 dataset...")
 
-    # Create model with same architecture as training
-    model = create_trm_model(vocab_size=vocab_size)
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    # Load checkpoint
-    epoch, metrics, config = load_checkpoint(checkpoint_path, model)
+    # ARC-AGI-2 download URLs from GitHub
+    urls = [
+        "https://raw.githubusercontent.com/arcprize/ARC-AGI-2/main/data/training/train.jsonl",
+        "https://raw.githubusercontent.com/arcprize/ARC-AGI-2/main/data/evaluation/eval.jsonl"
+    ]
 
-    return model, config
+    filenames = ["training.jsonl", "evaluation.jsonl"]
 
+    for url, filename in zip(urls, filenames):
+        filepath = output_path / filename
 
-def evaluate_checkpoint(
-    checkpoint_path: str,
-    data_path: str = "data",
-    output_path: Optional[str] = None,
-    device: str = "auto"
-) -> Dict[str, Any]:
-    """Evaluate a model checkpoint on all datasets."""
-    checkpoint_path = Path(checkpoint_path)
-    data_path = Path(data_path)
-
-    # Setup device
-    if device == "auto":
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    else:
-        device = torch.device(device)
-
-    print(f"Evaluating checkpoint: {checkpoint_path}")
-    print(f"Using device: {device}")
-
-    # Load model for each dataset (different vocab sizes)
-    results = {}
-
-    for dataset_name in ['arc', 'sudoku', 'maze']:
-        print(f"\nEvaluating on {dataset_name.upper()}...")
+        if filepath.exists():
+            print(f"   {filename} already exists, skipping...")
+            continue
 
         try:
-            vocab_size = get_vocab_size(dataset_name)
-            model, config = load_model_for_evaluation(checkpoint_path, vocab_size, device)
-
-            evaluator = Evaluator(
-                model,
-                device,
-                recursion_depth=config.get('recursion_depth', 12)
-            )
-
-            dataset_results = evaluator.evaluate_all_datasets(data_path)
-            results[dataset_name] = dataset_results
-
+            print(f"   Downloading {filename}...")
+            urllib.request.urlretrieve(url, filepath)
+            print(f"   Downloaded {filename}")
         except Exception as e:
-            print(f"Error evaluating {dataset_name}: {e}")
-            results[dataset_name] = {'error': str(e)}
+            print(f"   Failed to download {filename}: {e}")
+            # Try alternative Hugging Face URLs
+            try:
+                hf_urls = [
+                    "https://huggingface.co/datasets/eturok/ARC-AGI-2/resolve/main/train.jsonl",
+                    "https://huggingface.co/datasets/eturok/ARC-AGI-2/resolve/main/eval.jsonl"
+                ]
+                alt_url = hf_urls[0] if "training" in filename else hf_urls[1]
+                print(f"   Trying alternative URL for {filename}...")
+                urllib.request.urlretrieve(alt_url, filepath)
+                print(f"   Downloaded {filename} from alternative source")
+            except Exception as e2:
+                print(f"   Failed to download {filename} from all sources: {e2}")
 
-    # Compute aggregate metrics
-    aggregate_results = compute_aggregate_metrics(results)
-
-    # Save results
-    if output_path:
-        output_path = Path(output_path)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(output_path, 'w') as f:
-            json.dump({
-                'checkpoint': str(checkpoint_path),
-                'results': results,
-                'aggregate': aggregate_results
-            }, f, indent=2)
-
-        print(f"\nResults saved to {output_path}")
-
-    # Print summary
-    print("\n" + "="*50)
-    print("EVALUATION SUMMARY")
-    print("="*50)
-    print(f"Checkpoint: {checkpoint_path}")
-    print(f"Aggregate Token Accuracy: {aggregate_results['avg_token_accuracy']:.4f}")
-    print(f"Aggregate Sequence Accuracy: {aggregate_results['avg_sequence_accuracy']:.4f}")
-    print()
-
-    for dataset, metrics in aggregate_results['per_dataset'].items():
-        print(f"{dataset.upper()}: Token Acc={metrics['token_accuracy']:.4f}, "
-              f"Seq Acc={metrics['sequence_accuracy']:.4f}")
-
-    return {
-        'results': results,
-        'aggregate': aggregate_results
-    }
+    print("ARC-AGI-2 download complete!")
 
 
-def compute_aggregate_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute aggregate metrics across datasets."""
-    per_dataset = {}
-    total_token_acc = 0.0
-    total_seq_acc = 0.0
-    num_datasets = 0
-
-    for dataset_name, dataset_results in results.items():
-        if 'error' in dataset_results:
-            continue
-
-        # Get validation results (or training if val not available)
-        if 'val' in dataset_results:
-            metrics = dataset_results['val']
-        elif 'train' in dataset_results:
-            metrics = dataset_results['train']
-        else:
-            continue
-
-        per_dataset[dataset_name] = {
-            'token_accuracy': metrics['token_accuracy'],
-            'sequence_accuracy': metrics['sequence_accuracy'],
-            'loss': metrics['loss']
-        }
-
-        total_token_acc += metrics['token_accuracy']
-        total_seq_acc += metrics['sequence_accuracy']
-        num_datasets += 1
-
-    return {
-        'avg_token_accuracy': total_token_acc / num_datasets if num_datasets > 0 else 0.0,
-        'avg_sequence_accuracy': total_seq_acc / num_datasets if num_datasets > 0 else 0.0,
-        'num_datasets': num_datasets,
-        'per_dataset': per_dataset
-    }
-
-
-def benchmark_recursion_depths(
-    checkpoint_path: str,
-    data_path: str = "data",
-    recursion_depths: List[int] = [5, 10, 15, 20],
-    dataset: str = "arc"
-) -> Dict[str, Any]:
-    """Benchmark model performance across different recursion depths."""
-    checkpoint_path = Path(checkpoint_path)
-    data_path = Path(data_path)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    vocab_size = get_vocab_size(dataset)
-    model, config = load_model_for_evaluation(checkpoint_path, vocab_size, device)
-
-    results = {}
-
-    for K in recursion_depths:
-        print(f"Evaluating with K={K}...")
-
-        evaluator = Evaluator(model, device, recursion_depth=K)
-        metrics = evaluator.evaluate_dataset(dataset, data_path, split="val")
-
-        results[K] = {
-            'token_accuracy': metrics['token_accuracy'],
-            'sequence_accuracy': metrics['sequence_accuracy'],
-            'loss': metrics['loss']
-        }
-
-        print(f"K={K}: Token Acc={metrics['token_accuracy']:.4f}")
-
-    return results
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate TRM model")
-    parser.add_argument("--checkpoint", type=str, required=True,
+def main():
+    parser = argparse.ArgumentParser(description="Comprehensive TRM Evaluation")
+    parser.add_argument("--checkpoint", type=str, default="outputs/best_model.pth",
                        help="Path to model checkpoint")
     parser.add_argument("--data_path", type=str, default="data",
-                       help="Path to dataset directory")
-    parser.add_argument("--output", type=str,
-                       help="Output JSON file for results")
-    parser.add_argument("--device", type=str, default="auto",
-                       help="Device to use (auto, cpu, cuda)")
-    parser.add_argument("--benchmark_depths", action="store_true",
-                       help="Benchmark different recursion depths")
-    parser.add_argument("--dataset", type=str, choices=['arc', 'sudoku', 'maze'],
-                       default="arc", help="Dataset for depth benchmarking")
+                       help="Path to data directory")
+    parser.add_argument("--output", type=str, default="comprehensive_results.json",
+                       help="Output JSON file")
+    parser.add_argument("--datasets", nargs="+", choices=["arc", "sudoku", "all"],
+                       default=["all"], help="Datasets to evaluate on (maze not supported)")
+    parser.add_argument("--download_arc2", action="store_true",
+                       help="Download ARC-AGI-2 dataset")
+    parser.add_argument("--arc2_dir", type=str, default="data/arc2",
+                       help="Directory to save ARC-AGI-2 dataset")
 
     args = parser.parse_args()
 
-    if args.benchmark_depths:
-        results = benchmark_recursion_depths(
-            args.checkpoint,
-            args.data_path,
-            dataset=args.dataset
-        )
+    # Download ARC-AGI-2 if requested
+    if args.download_arc2:
+        download_arc_agi_2(args.arc2_dir)
 
-        print("\nRecursion Depth Benchmarking Results:")
-        for K, metrics in results.items():
-            print(f"K={K}: Token Acc={metrics['token_accuracy']:.4f}")
+    # Load model
+    print("Loading model and checkpoint...")
+    vocab_size = 11  # ARC colors 0-10
+    model = TinyRecursiveModel(
+        vocab_size=vocab_size,
+        embed_dim=64,
+        latent_dim=32,
+        num_layers=2,
+        num_heads=4,
+        ff_dim=256,
+        dropout=0.3
+    )
 
-        if args.output:
-            with open(args.output, 'w') as f:
-                json.dump(results, f, indent=2)
-    else:
-        evaluate_checkpoint(
-            args.checkpoint,
-            args.data_path,
-            args.output,
-            args.device
-        )
+    checkpoint_path = Path(args.checkpoint)
+    epoch, metrics, config = load_checkpoint(checkpoint_path, model)
+    print(f"Loaded checkpoint from epoch {epoch}")
+
+    # Create evaluator
+    device = torch.device('cpu')
+    evaluator = ComprehensiveEvaluator(model, device, recursion_depth=5)
+
+    # Evaluate on requested datasets
+    all_results = []
+
+    if "all" in args.datasets or "arc" in args.datasets:
+        arc_result = evaluator.evaluate_arc(args.data_path, "val")
+        if arc_result:
+            all_results.append(arc_result)
+
+    # Maze evaluation removed - TRM architecture not suitable for maze navigation tasks
+
+    if "all" in args.datasets or "sudoku" in args.datasets:
+        sudoku_result = evaluator.evaluate_sudoku(args.data_path)
+        if sudoku_result:
+            all_results.append(sudoku_result)
+
+    # Save comprehensive results
+    final_results = {
+        "model": "TRM (Tiny Recursive Model)",
+        "checkpoint": str(checkpoint_path),
+        "epoch": epoch,
+        "recursion_depth": 5,
+        "model_params": "257K",
+        "results": all_results,
+        "summary": {
+            "datasets_evaluated": len(all_results),
+            "best_accuracy": max([r["accuracy"] for r in all_results]) if all_results else 0,
+            "average_accuracy": sum([r["accuracy"] for r in all_results]) / len(all_results) if all_results else 0
+        }
+    }
+
+    with open(args.output, 'w') as f:
+        json.dump(final_results, f, indent=2)
+
+    print("\nFinal Summary:")
+    for result in all_results:
+        print(".4f")
+    print(f"\nResults saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
