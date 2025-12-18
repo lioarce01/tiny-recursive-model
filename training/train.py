@@ -19,7 +19,9 @@ import logging
 
 from models.trm import TinyRecursiveModel, create_trm_model
 from data.datasets import create_data_loader, get_vocab_size
+from data.multitask_dataset import create_multitask_data_loader, expand_datasets_if_needed
 from training.utils import EMA, save_checkpoint, load_checkpoint, compute_accuracy
+from training.model_naming import generate_model_name, create_model_directory, save_model_metadata
 
 
 class WarmupScheduler:
@@ -184,26 +186,55 @@ def train_model(config: Dict[str, Any]) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
 
-    # Create data loaders
-    train_loader = create_data_loader(
-        config['dataset'],
-        config['data_path'],
-        split='train',
-        batch_size=config['batch_size'],
-        max_samples=config['max_train_samples']
-    )
+    # Create data loaders - support both single-task and multi-task
+    if config.get('dataset') == 'multitask':
+        # Multi-task training
+        train_loader = create_multitask_data_loader(
+            config['data_path'],
+            split='train',
+            datasets=config.get('multitask_datasets', ['arc', 'sudoku', 'maze']),
+            dataset_weights=config.get('multitask_weights', {}),
+            batch_size=config['batch_size'],
+            shuffle=True,
+            max_samples_per_dataset=config.get('max_samples_per_dataset')
+        )
 
-    val_loader = create_data_loader(
-        config['dataset'],
-        config['data_path'],
-        split='val',
-        batch_size=config['batch_size'],
-        shuffle=False,
-        max_samples=config['max_val_samples']
-    )
+        # For validation, we'll use a single dataset (ARC) for simplicity
+        val_loader = create_data_loader(
+            'arc',  # Use ARC for validation
+            config['data_path'],
+            split='val',
+            batch_size=config['batch_size'],
+            shuffle=False,
+            max_samples=config['max_val_samples']
+        )
+        logger.info(f"Multi-task training with datasets: {config.get('multitask_datasets', [])}")
+    else:
+        # Single-task training
+        train_loader = create_data_loader(
+            config['dataset'],
+            config['data_path'],
+            split='train',
+            batch_size=config['batch_size'],
+            max_samples=config['max_train_samples']
+        )
+
+        val_loader = create_data_loader(
+            config['dataset'],
+            config['data_path'],
+            split='val',
+            batch_size=config['batch_size'],
+            shuffle=False,
+            max_samples=config['max_val_samples']
+        )
+
+    # Determine vocab size
+    if config.get('dataset') == 'multitask':
+        vocab_size = config.get('vocab_size', 11)  # Use unified vocab for multi-task
+    else:
+        vocab_size = get_vocab_size(config['dataset'])
 
     # Create model
-    vocab_size = get_vocab_size(config['dataset'])
     model = create_trm_model(
         vocab_size=vocab_size,
         max_seq_len=config['max_seq_len'],
@@ -230,9 +261,16 @@ def train_model(config: Dict[str, Any]) -> None:
     # Create EMA model
     ema_model = EMA(model, decay=config['ema_decay']) if config['use_ema'] else None
 
-    # Create output directory
-    output_dir = Path(config['output_dir'])
-    output_dir.mkdir(exist_ok=True)
+    # Generate model name and create output directory
+    experiment_type = "multitask" if config.get('dataset') == 'multitask' else "single"
+    model_name = generate_model_name(config, experiment_type)
+    output_dir = create_model_directory(model_name, config['output_dir'])
+
+    # Save model metadata
+    save_model_metadata(output_dir, config)
+
+    logger.info(f"Training model: {model_name}")
+    logger.info(f"Output directory: {output_dir}")
 
     # Training loop
     best_val_accuracy = 0.0
@@ -298,10 +336,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train TRM model")
     parser.add_argument("--config", type=str, required=True,
                        help="Path to training config JSON file")
-    parser.add_argument("--dataset", type=str, choices=['arc', 'sudoku', 'maze'],
+    parser.add_argument("--dataset", type=str,
                        help="Override dataset in config")
     parser.add_argument("--output_dir", type=str,
                        help="Override output directory")
+    parser.add_argument("--expand_datasets", action="store_true",
+                       help="Expand datasets to recommended sizes")
 
     args = parser.parse_args()
 
@@ -314,6 +354,11 @@ if __name__ == "__main__":
         config['dataset'] = args.dataset
     if args.output_dir:
         config['output_dir'] = args.output_dir
+
+    # Expand datasets if requested
+    if args.expand_datasets:
+        print("Expanding datasets for multi-task training...")
+        expand_datasets_if_needed()
 
     # Train model
     train_model(config)
