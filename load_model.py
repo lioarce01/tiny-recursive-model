@@ -13,6 +13,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
 from models.trm import TinyRecursiveModel
+from models.trm_multitask import MultiTaskTRM, create_multitask_trm
 from training.model_naming import list_available_models, load_model_metadata
 
 
@@ -59,16 +60,34 @@ def load_trained_model(model_name_or_path, device='cpu'):
     with open(config_path, 'r') as f:
         config = json.load(f)
 
-    # Create model
-    model = TinyRecursiveModel(
-        vocab_size=config.get('vocab_size', 11),
-        embed_dim=config['embed_dim'],
-        latent_dim=config['latent_dim'],
-        num_layers=config['num_layers'],
-        num_heads=config['num_heads'],
-        ff_dim=config['ff_dim'],
-        dropout=0.3  # Use consistent dropout
-    )
+    # Detect if this is a multitask model
+    is_multitask = config.get('dataset') == 'multitask' or 'multitask_datasets' in config
+
+    if is_multitask:
+        # Create multi-task model
+        model = create_multitask_trm(
+            vocab_size=config.get('vocab_size', 12),
+            embed_dim=config.get('embed_dim', 64),
+            latent_dim=config.get('latent_dim', 32),
+            num_layers=config.get('num_layers', 2),
+            num_heads=config.get('num_heads', 4),
+            ff_dim=config.get('ff_dim', 256),
+            num_tasks=len(config.get('multitask_datasets', ['arc', 'sudoku', 'maze'])),
+            dropout=config.get('dropout', 0.1)
+        )
+        model_type = "Multi-Task TRM"
+    else:
+        # Create regular TRM model
+        model = TinyRecursiveModel(
+            vocab_size=config.get('vocab_size', 11),
+            embed_dim=config['embed_dim'],
+            latent_dim=config['latent_dim'],
+            num_layers=config['num_layers'],
+            num_heads=config['num_heads'],
+            ff_dim=config['ff_dim'],
+            dropout=0.3  # Use consistent dropout
+        )
+        model_type = "TRM"
 
     # Load checkpoint
     checkpoint_path = model_dir / "best_model.pth"
@@ -87,12 +106,14 @@ def load_trained_model(model_name_or_path, device='cpu'):
     model.to(device)
     model.eval()
 
-    print("Loaded model:")
+    print(f"Loaded {model_type} model:")
     print(f"  Name: {metadata['model_name']}")
     print(f"  Created: {metadata['created_at']}")
     print(".1f")
     print(f"  Parameters: {metadata['config']['embed_dim']}d_{metadata['config']['latent_dim']}l")
     print(f"  Device: {device}")
+    if is_multitask:
+        print(f"  Tasks: {config.get('multitask_datasets', ['arc', 'sudoku', 'maze'])}")
 
     return model, metadata
 
@@ -126,8 +147,15 @@ def main():
     model, metadata = load_trained_model(args.model, args.device)
 
     if model is not None:
+        # Check if multitask
+        is_multitask = metadata['config'].get('dataset') == 'multitask' or 'multitask_datasets' in metadata['config']
+
         print("\nModel ready for inference!")
-        print(f"Use model.forward(input, K={metadata['config']['recursion_depth']}) for predictions")
+        if is_multitask:
+            print("Use model.forward(input, task_name, K=K) for predictions")
+            print("Available tasks: arc, sudoku, maze")
+        else:
+            print(f"Use model.forward(input, K={metadata['config']['recursion_depth']}) for predictions")
     else:
         print("Failed to load model")
 

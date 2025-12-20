@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import time
 import logging
+import psutil
+import gc
 import random
 import numpy as np
 
@@ -272,6 +274,19 @@ def validate_multitask(
     return results
 
 
+def get_memory_usage():
+    """Get current memory usage in GB."""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 ** 3)  # Convert to GB
+
+
+def optimize_memory():
+    """Force memory cleanup."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def train_multitask_model(config: Dict[str, Any]):
     """Train multi-task TRM model Samsung-style."""
 
@@ -378,11 +393,25 @@ def train_multitask_model(config: Dict[str, Any]):
     for epoch in range(config['num_epochs']):
         logger.info(f"Starting epoch {epoch + 1}/{config['num_epochs']}")
 
+        # Memory optimization and monitoring
+        optimize_memory()
+        memory_usage = get_memory_usage()
+        logger.info(f"Memory usage before epoch {epoch + 1}: {memory_usage:.1f}GB")
+
         # Train epoch
         train_metrics = train_multitask_epoch(
             model, train_loader, optimizer, scheduler, ema_model,
             device, epoch, config, logger
         )
+
+        # Log memory after epoch
+        optimize_memory()
+        memory_after = get_memory_usage()
+        logger.info(f"Memory usage after epoch {epoch + 1}: {memory_after:.1f}GB")
+
+        # Warn if memory is getting high
+        if memory_after > 25:  # 25GB warning threshold
+            logger.warning(f"High memory usage: {memory_after:.1f}GB - Consider reducing batch_size or max_seq_len")
 
         # Validate on all tasks
         val_metrics = validate_multitask(model, val_loaders, device, config)
